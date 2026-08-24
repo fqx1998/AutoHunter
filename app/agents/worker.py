@@ -98,6 +98,7 @@ class Worker:
         self._js_tool_enabled = self._initial_js_tool_enabled()
         self._js_signal_seen = self._js_tool_enabled
         self._tool_counts: dict[str, int] = {}
+        self._http_urls: list[str] = []
         self._last_js_analysis_round = 0
         self._post_js_validation_count = 0
         # worker 主动上报的可复用情报（纯内存收集，由编排层 async 统一落全局情报库）
@@ -169,11 +170,22 @@ class Worker:
         return auth_bootstrap.user_auth_prompt_block(ctx, attempt)
 
     def _bootstrap_user_auth(self) -> None:
-        """启动时确定性使用用户凭据：注入 Cookie/Bearer 或尝试账密登录，并 emit 反馈。"""
+        """启动时强制试登：用户凭据区优先；否则/失败后再试泄露库前几组账密。"""
         ctx = (self.target_meta or {}).get("user_auth") or (self.target_meta or {}).get("auth_context")
-        if not ctx:
+        leak_creds = (self.target_meta or {}).get("leaked_creds") or []
+        result = None
+        if ctx:
+            result = auth_bootstrap.bootstrap_auth(self.executor, ctx, self.target)
+            if not result.source:
+                result.source = "user"
+        if result is None or result.status not in ("injected", "login_ok"):
+            leak_result = auth_bootstrap.bootstrap_leaked_creds(
+                self.executor, leak_creds, self.target,
+            )
+            if leak_result is not None:
+                result = leak_result
+        if result is None:
             return
-        result = auth_bootstrap.bootstrap_auth(self.executor, ctx, self.target)
         payload = result.as_event()
         self.target_meta["auth_attempt"] = payload
         self._emit(
@@ -208,6 +220,7 @@ class Worker:
             p = (c.get("password") or "")[:40]
             h = (c.get("host") or "")[:40]
             lines.append(f"- {u} : {p}  （泄露于 {h}）")
+        lines.append("系统启动时会自动尝试前 3 组高分账密，成败见看板 Worker 卡片「凭据·登录成功/失败」。")
         lines.append("纪律：登录成功/CASTGC/session/个人中心本身不算洞；必须继续实证死规矩敏感数据、越权、敏感写操作、注入/上传 getshell 或具体业务系统危害。没实锤就写 deepen_lead；试 2-3 个高价值凭证失败就换攻击面；严禁改密。")
         return "\n".join(lines) + "\n\n"
 
@@ -638,6 +651,7 @@ class Worker:
             "directive": "\n".join(directive_bits)[:2000],
             "worker_notes": notes[:4000],
             "session_cookies": cookies,
+            "session_cookie_jar": snap.get("session_cookie_jar") or [],
             "session_headers": headers,
             "rounds_done": rounds,
             "source": "llm_interrupt",
@@ -652,11 +666,13 @@ class Worker:
             return
         notes = str(ctx.get("worker_notes") or "")
         cookies = ctx.get("session_cookies") if isinstance(ctx.get("session_cookies"), dict) else {}
+        jar = ctx.get("session_cookie_jar") if isinstance(ctx.get("session_cookie_jar"), list) else []
         headers = ctx.get("session_headers") if isinstance(ctx.get("session_headers"), dict) else {}
         self.executor.restore_resume_state(
             worker_notes=notes,
             session_cookies=cookies,
             session_headers=headers,
+            session_cookie_jar=jar,
         )
         self._emit(
             "worker_resume",
@@ -746,6 +762,9 @@ class Worker:
                     "若没有明确攻击面就 finish(verdict=no_vuln)。",
                 )
             self._emit("tool_http", round=rnd, url=url, method=args.get("method", "GET"))
+            self._http_urls.append(url)
+            if len(self._http_urls) > 80:
+                self._http_urls = self._http_urls[-80:]
             self._maybe_enable_js_tool(url, "worker 主动请求 JS 资源")
             result = self.executor.http_request(
                 url=url,
@@ -753,6 +772,7 @@ class Worker:
                 headers=args.get("headers"),
                 data=args.get("data"),
                 json_body=args.get("json_body"),
+                files=args.get("files"),
                 follow_redirects=args.get("follow_redirects", False),
                 confirm_destructive=args.get("confirm_destructive", False),
                 confirm_reason=args.get("confirm_reason") or "",
@@ -824,6 +844,14 @@ class Worker:
             value = args.get("value") or ""
             self._emit("tool_decode", round=rnd, mode=args.get("mode", "auto"), value_len=len(str(value)))
             return self.executor.decode_transform(value=value, mode=args.get("mode", "auto"))
+
+        if name == "eval_javascript":
+            self._mark_tool_used(name, rnd)
+            code = args.get("code") or ""
+            if not str(code).strip():
+                return self._tool_arg_error("eval_javascript", "code", "必须传要执行的 JS，结果 console.log 出来。")
+            self._emit("tool_eval_js", round=rnd, code_len=len(str(code)))
+            return self.executor.eval_javascript(code=code, timeout=args.get("timeout", 8))
 
         if name == "suggest_waf_bypass":
             self._mark_tool_used(name, rnd)
@@ -922,6 +950,12 @@ class Worker:
             return ""
         if self.deepen_context:
             return ""
+        exposed = self._untested_exposed_endpoint()
+        if exposed:
+            return (
+                f"过早结束：搜集阶段已确认暴露端点 {exposed}，不能按纯前端静态站收尾。"
+                "先 GET 该路径验证是否真实开放，再决定是否无洞。"
+            )
         if self._js_signal_seen and not self._tool_counts.get("analyze_javascript"):
             return (
                 f"过早结束：已出现 JS/API/前端接口信号，但第 {rnd} 轮仍未调用 analyze_javascript。"
@@ -960,6 +994,40 @@ class Worker:
         return any(x in text for x in unreachable) or (
             any(x in text for x in static_or_empty) and any(x in text for x in no_surface)
         )
+
+    def _exposed_endpoint_hints(self) -> list[str]:
+        text = "\n".join([
+            str((self.target_meta or {}).get("priority_reason") or ""),
+            str((self.target_meta or {}).get("playbook_block") or ""),
+            " ".join((self.target_meta or {}).get("playbook_route", {}).get("tags") or [])
+            if isinstance((self.target_meta or {}).get("playbook_route"), dict) else "",
+            self.target or "",
+        ])
+        found = re.findall(
+            r"(/druid(?:/index\.html)?|/actuator(?:/[a-z0-9._-]+)?|/nacos/?)",
+            text,
+            re.I,
+        )
+        out: list[str] = []
+        for item in found:
+            low = item.lower()
+            if low not in out:
+                out.append(low)
+        return out
+
+    def _untested_exposed_endpoint(self) -> str:
+        hints = self._exposed_endpoint_hints()
+        if not hints:
+            return ""
+        hit = " ".join(self._http_urls).lower()
+        for ep in hints:
+            token = ep.rstrip("/").split("/")[-1]
+            if token and token in hit:
+                continue
+            if ep in hit:
+                continue
+            return ep
+        return ""
 
     def _maybe_enable_js_tool(self, text: str, reason: str) -> bool:
         if self._js_tool_enabled:
@@ -1004,8 +1072,8 @@ class Worker:
                 return f"302 跳转到 {loc[:120]}：若是跳登录页说明需要登录态；若是跳 ticket/SSO 链，设 follow_redirects=true 跟完整个登录链。"
             if "timed out" in err.lower() or "timeout" in err.lower():
                 return "请求超时：目标可能慢或不可达。换更小范围的请求、加大 timeout、或确认目标是否在线；连续超时就 finish。"
-            if "connection" in err.lower() or "refused" in err.lower() or "unreachable" in err.lower():
-                return "连接失败：目标可能下线/防火墙拦截/端口未开放。确认目标可达性(换个端口/协议)；不可达就 finish(no_vuln)。"
+            if "connection" in err.lower() or "refused" in err.lower() or "unreachable" in err.lower() or "reset" in err.lower():
+                return "连接失败：常见是网关按扫描器 UA 掐 TCP，不是 WAF 拦截页。http_request 已默认 Chrome UA；若用 run_shell 的 httpx/curl，加浏览器 UA 再试一次。没有拦截页就不要 suggest_waf_bypass。仍不通再 finish。"
         if tool == "run_shell":
             rc = result.get("return_code")
             if rc and rc != 0:
