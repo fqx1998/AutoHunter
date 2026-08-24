@@ -41,6 +41,7 @@ _WORKDIR_MAX_BYTES = int(os.environ.get("WORKER_WORKDIR_MAX_BYTES", str(50 * 102
 # _dir_size 用非递归 glob，只数顶层文件，git clone 落的子目录树不在统计内）。
 _WORKDIR_RESCAN_EVERY = 32
 _SHELL_CAPTURE_MAX_BYTES = int(os.environ.get("WORKER_SHELL_CAPTURE_MAX_BYTES", str(512 * 1024)))
+_HTTP_MAX_BYTES = int(os.environ.get("WORKER_HTTP_MAX_BYTES", str(1024 * 1024)))
 _REFLECT_GUIDANCE = (
     "本次未执行。请先反思：会不会删库、清缓存、覆盖已有文件导致改不回？"
     "能改成 SRC_TEST_ 哨兵、ROLLBACK、或只证明接口存在就不要做破坏。"
