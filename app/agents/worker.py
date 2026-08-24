@@ -170,22 +170,11 @@ class Worker:
         return auth_bootstrap.user_auth_prompt_block(ctx, attempt)
 
     def _bootstrap_user_auth(self) -> None:
-        """启动时强制试登：用户凭据区优先；否则/失败后再试泄露库前几组账密。"""
+        """启动时确定性使用用户凭据：注入 Cookie/Bearer 或尝试账密登录，并 emit 反馈。"""
         ctx = (self.target_meta or {}).get("user_auth") or (self.target_meta or {}).get("auth_context")
-        leak_creds = (self.target_meta or {}).get("leaked_creds") or []
-        result = None
-        if ctx:
-            result = auth_bootstrap.bootstrap_auth(self.executor, ctx, self.target)
-            if not result.source:
-                result.source = "user"
-        if result is None or result.status not in ("injected", "login_ok"):
-            leak_result = auth_bootstrap.bootstrap_leaked_creds(
-                self.executor, leak_creds, self.target,
-            )
-            if leak_result is not None:
-                result = leak_result
-        if result is None:
+        if not ctx:
             return
+        result = auth_bootstrap.bootstrap_auth(self.executor, ctx, self.target)
         payload = result.as_event()
         self.target_meta["auth_attempt"] = payload
         self._emit(
@@ -220,7 +209,6 @@ class Worker:
             p = (c.get("password") or "")[:40]
             h = (c.get("host") or "")[:40]
             lines.append(f"- {u} : {p}  （泄露于 {h}）")
-        lines.append("系统启动时会自动尝试前 3 组高分账密，成败见看板 Worker 卡片「凭据·登录成功/失败」。")
         lines.append("纪律：登录成功/CASTGC/session/个人中心本身不算洞；必须继续实证死规矩敏感数据、越权、敏感写操作、注入/上传 getshell 或具体业务系统危害。没实锤就写 deepen_lead；试 2-3 个高价值凭证失败就换攻击面；严禁改密。")
         return "\n".join(lines) + "\n\n"
 
