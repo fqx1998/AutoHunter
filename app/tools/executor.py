@@ -261,6 +261,8 @@ class ToolExecutor:
         self._workdir_bytes: int = self._dir_size()
         self._writes_since_scan: int = 0
         self._over_cap: bool = False   # 一旦确认超上限即置位：work_dir 只增不删，此后直接短路不再全扫
+        self._cookie_hub: Any = None
+        self._relogin_retrying = False
 
     def cancel_running(self) -> None:
         """协作取消：置取消信号 + 杀子进程。仅用于控制面真取消（pause/stop/超时）。
@@ -495,6 +497,12 @@ class ToolExecutor:
         incoming_cookie = _pop_header(headers, "Cookie")
         overlay = _parse_cookie_header(incoming_cookie)
         files_norm = _normalize_files(files, self.work_dir)
+        hub = self._cookie_hub
+        if hub is not None and not self._relogin_retrying:
+            try:
+                hub.pull(self)
+            except Exception:
+                pass
         try:
             check_http_request(
                 method, url, data=data, json_body=json_body, files=files_norm,
@@ -566,6 +574,27 @@ class ToolExecutor:
             result["session_applied"] = session_applied
         if session_updated:
             result["session_cookies_updated"] = session_updated
+        if hub is not None:
+            try:
+                hub.push(self)
+            except Exception:
+                pass
+            if not self._relogin_retrying:
+                try:
+                    if hub.maybe_relogin(self, result):
+                        self._relogin_retrying = True
+                        try:
+                            return self.http_request(
+                                url, method=method, headers=headers, data=data,
+                                json_body=json_body, files=files,
+                                follow_redirects=follow_redirects, timeout=timeout,
+                                confirm_destructive=confirm_destructive,
+                                confirm_reason=confirm_reason,
+                            )
+                        finally:
+                            self._relogin_retrying = False
+                except Exception:
+                    self._relogin_retrying = False
         return result
 
     # ---- 会话状态管理（全模式）----
@@ -748,12 +777,19 @@ class ToolExecutor:
                         continue
                     if k in self._session_headers or len(self._session_headers) < _SESSION_MAX_HEADERS:
                         self._session_headers[k] = str(v)[:4096]
-            return {
+            out = {
                 "ok": True,
                 "active_cookies": sorted(self._session_cookies.keys()),
                 "active_headers": sorted(self._session_headers.keys()),
                 "guidance": "已更新会话态，后续 http_request 会自动携带；继续以此据点深挖受限接口。",
             }
+            hub = self._cookie_hub
+            if hub is not None and not clear and (self._session_cookies or self._session_headers):
+                try:
+                    hub.push(self)
+                except Exception:
+                    pass
+            return out
         except Exception as e:
             return {"ok": False, "error": f"session_set 异常: {type(e).__name__}: {e}"}
 

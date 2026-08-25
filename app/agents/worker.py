@@ -23,6 +23,7 @@ from app.agents.edu_scope import edu_bombing_block_reason
 from app.agents.write_proof import HARMLESS_PROTOCOL, weak_write_block_reason
 from app.agents import auth_bootstrap
 from app.config import worker_config
+from app.tools.cookie_manager import CookieHub
 from app import dedup
 from app.llm.client import LLMClient, LLMError, llm_error_event_fields
 from app.schemas import Finding, Verdict, WorkerResult
@@ -70,8 +71,10 @@ class Worker:
         prompt_version: str | None = None,
         src_rules: str = "",
         pop_directive: Optional[Callable[[], Optional[str]]] = None,
+        task_id: str = "",
     ):
         self.target = target
+        self.task_id = task_id or ""
         self.llm = llm or LLMClient()
         self.cancel_event = cancel_event or threading.Event()
         self.src_type = src_type
@@ -83,6 +86,8 @@ class Worker:
             enterprise=self._enterprise, fofa_key=fofa_key, fofa_base_url=fofa_base_url,
             engine=engine,
         )
+        self._cookie_hub = CookieHub(self.task_id, target)
+        self.executor._cookie_hub = self._cookie_hub
         self.findings: list[Finding] = []
         self.on_event = on_event or (lambda kind, data: None)
         self._finished: Optional[dict] = None
@@ -170,11 +175,57 @@ class Worker:
         return auth_bootstrap.user_auth_prompt_block(ctx, attempt)
 
     def _bootstrap_user_auth(self) -> None:
-        """启动时确定性使用用户凭据：注入 Cookie/Bearer 或尝试账密登录，并 emit 反馈。"""
+        """启动时：全局 Cookie 优先，否则用用户凭据登录；失败则后续 http 自动重登。"""
         ctx = (self.target_meta or {}).get("user_auth") or (self.target_meta or {}).get("auth_context")
-        if not ctx:
+        if not isinstance(ctx, dict):
+            ctx = None
+        hub = self._cookie_hub
+        if ctx:
+            hub.remember_from_auth_context(ctx)
+        elif hub.creds().get("username") and hub.creds().get("password"):
+            stored = hub.creds()
+            ctx = {
+                "matched": True,
+                "kinds": ["password"],
+                "username": stored.get("username") or "",
+                "password": stored.get("password") or "",
+                "login_url": stored.get("login_url") or "",
+                "matched_by": "shared",
+                "binding_target": "全局会话",
+            }
+            self.target_meta["user_auth"] = ctx
+            self.target_meta["auth_context"] = ctx
+        hub.bootstrapping = True
+        result = None
+        login_base = auth_bootstrap.login_origin(self.target) or self.target
+        try:
+            if hub.apply(self.executor):
+                names = sorted(getattr(self.executor, "_session_cookies", {}).keys())[:30]
+                headers = sorted(getattr(self.executor, "_session_headers", {}).keys())[:20]
+                result = auth_bootstrap.AuthAttemptResult(
+                    used=True, matched=True, status="injected",
+                    kinds=["cookie"], matched_by="shared", binding_target="全局会话",
+                    reason="复用本站全局 Cookie",
+                    cookie_names=names, header_names=headers,
+                )
+            if result is None and ctx:
+                with hub.login_turn() as action:
+                    if action == "reuse" and hub.apply(self.executor):
+                        names = sorted(getattr(self.executor, "_session_cookies", {}).keys())[:30]
+                        result = auth_bootstrap.AuthAttemptResult(
+                            used=True, matched=True, status="injected",
+                            kinds=["cookie"], matched_by="shared", binding_target="全局会话",
+                            reason="复用本站全局 Cookie",
+                            cookie_names=names,
+                        )
+                    else:
+                        result = auth_bootstrap.bootstrap_auth(self.executor, ctx, login_base)
+                        if result.status in ("injected", "login_ok"):
+                            hub.ingest(self.executor, status=result.status)
+        finally:
+            hub.bootstrapping = False
+        if result is None:
             return
-        result = auth_bootstrap.bootstrap_auth(self.executor, ctx, self.target)
         payload = result.as_event()
         self.target_meta["auth_attempt"] = payload
         self._emit(
@@ -197,6 +248,11 @@ class Worker:
 
     def _creds_block(self) -> str:
         """泄露凭证情报：搜集阶段查到的该域已泄露账号密码（已过滤打分）。"""
+        ctx = (self.target_meta or {}).get("user_auth") or (self.target_meta or {}).get("auth_context")
+        if auth_bootstrap.has_login_material(ctx):
+            return ""
+        if self._cookie_hub.creds().get("username"):
+            return ""
         creds = (self.target_meta or {}).get("leaked_creds") or []
         if not creds:
             return ""
@@ -662,6 +718,11 @@ class Worker:
             session_headers=headers,
             session_cookie_jar=jar,
         )
+        if cookies or headers or jar:
+            try:
+                self._cookie_hub.ingest(self.executor, status="injected")
+            except Exception:
+                pass
         self._emit(
             "worker_resume",
             notes_len=len(notes),
