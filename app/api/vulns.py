@@ -150,10 +150,11 @@ async def list_vulns(
         .join(Review, Review.finding_id == Finding.id)
         .outerjoin(Task, Task.id == Finding.task_id)
         .where(and_(*conds))
-        # 排序规则：置顶优先 → 等级降序(高危>中危>低危) → 创建时间降序。
-        # 保证置顶的高危漏洞永远排最前，且对筛选/搜索结果同样生效。
+        # 置顶优先；未置顶仍保持原规则：未提交在前 → 分数 → 等级 → 时间。
         .order_by(
             Finding.is_top.desc(),
+            Review.submitted,
+            Review.score.desc(),
             _SEVERITY_RANK.desc(),
             Finding.created_at.desc(),
         )
